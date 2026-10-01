@@ -1,4 +1,5 @@
 //@version=6
+//@strategy_alert_message {{strategy.order.alert_message}}
 strategy("DUI - don't use it", overlay=true,
      initial_capital         = 10000,
      currency                = currency.USD,
@@ -8,446 +9,496 @@ strategy("DUI - don't use it", overlay=true,
      default_qty_type        = strategy.fixed,
      default_qty_value       = 1,
      pyramiding              = 0,
-     process_orders_on_close = true)
+     margin_long             = 100,
+     margin_short            = 100,
+     calc_on_every_tick      = false,
+     calc_on_order_fills     = false,
+     process_orders_on_close = true,
+     max_boxes_count         = 4)
 
-// ---------------- Inputs ----------------
-int   swingLength    = input.int(10, "Swing Length (BOS/Structure)", minval=1, group="Structure")
-bool  useFVG         = input.bool(true, "Use FVG Entries",       group="Structure")
-bool  useOB          = input.bool(true, "Use Order Block Entries", group="Structure")
-float fvgMinGapPct   = input.float(0.0, "Minimum FVG Gap % (0 = disabled)", minval=0.0, step=0.05, group="Structure")
+// ---------------- Structure / Entry Inputs ----------------
+int   swingLength        = input.int(10, "Swing Length (BOS/Structure)", minval=1, maxval=500, group="Structure")
+bool  useFVG             = input.bool(true, "Use FVG Entries", group="Structure")
+bool  useOB              = input.bool(true, "Use Order Block Entries", group="Structure")
+float fvgMinGapPct       = input.float(0.0, "Minimum FVG Gap % (0 = disabled)", minval=0.0, step=0.05, group="Structure")
+float minDisplacementATR = input.float(0.0, "Minimum Displacement Body (x ATR, 0 = off)", minval=0.0, step=0.1, group="Structure",
+     tooltip="For FVGs, tests the middle candle in the gap direction. For OBs, tests the impulse candle. The original OB body/range test is also retained.")
+bool  requireObBOS       = input.bool(false, "Require BOS on Order Block Formation", group="Structure")
+bool  requireRejection   = input.bool(true, "Require Close Back Outside Entry Zone", group="Structure",
+     tooltip="Longs must close above the zone top; shorts below the zone bottom. Candle direction must agree. Entries always require a later-bar retest, never the formation bar.")
+bool  oneTradePerZone    = input.bool(true, "One Entry Order per Zone", group="Structure",
+     tooltip="Marks each triggering zone used after a valid entry order is submitted. Submission is an attempt, not proof of a fill. Used zones are gray.")
+int   maxZoneAgeBars     = input.int(0, "Maximum Zone Age (bars, 0 = off)", minval=0, group="Structure")
+bool  requireRecentBOS   = input.bool(false, "Require Recent Directional BOS for Entry", group="Structure")
+int   bosMemoryBars      = input.int(20, "BOS Memory (bars)", minval=1, group="Structure")
+int   cooldownBars       = input.int(0, "Extra Bars to Wait After Exit", minval=0, group="Structure",
+     tooltip="The exit bar itself is always blocked: its wick may have happened before the exit. Zero allows entries from the following bar; one also skips that bar.")
 
-// --- Filters ---
-bool   useTrendFilter   = input.bool(true,  "Use EMA Trend Filter",   group="Filters")
-int    emaLength        = input.int(200, "EMA Length", minval=1,       group="Filters")
+// ---------------- Filters ----------------
+bool   useTrendFilter   = input.bool(true, "Use EMA Trend Filter", group="Filters")
+int    emaLength        = input.int(200, "EMA Length", minval=1, group="Filters")
 bool   useHtfFilter     = input.bool(false, "Use HTF EMA Trend Filter", group="Filters")
-string htfTimeframe     = input.timeframe("240", "HTF Timeframe",     group="Filters")
-int    htfEmaLength     = input.int(200, "HTF EMA Length", minval=1,  group="Filters")
-bool   useSessionFilter = input.bool(false, "Use Session Filter",      group="Filters")
-string sessionStr       = input.session("0700-1600", "Trading Session (Exchange Time)", group="Filters")
-bool   useDateFilter    = input.bool(false, "Use Date Range Filter",   group="Filters")
+string htfTimeframe     = input.timeframe("240", "HTF Timeframe", group="Filters")
+int    htfEmaLength     = input.int(200, "HTF EMA Length", minval=1, group="Filters")
+bool   useSessionFilter = input.bool(false, "Use Session Filter", group="Filters")
+string sessionStr       = input.session("0700-1600", "Trading Session (Exchange Time)", group="Filters",
+     tooltip="The complete chart bar must fit inside the session. Applies to entries only and requires an intraday chart.")
+bool   useDateFilter    = input.bool(false, "Use Date Range Filter", group="Filters")
 int    startDateIn      = input.time(timestamp("2020-01-01"), "Start Date", group="Filters")
 int    endDateIn        = input.time(timestamp("2030-01-01"), "End Date", group="Filters")
 bool   useVolFilter     = input.bool(false, "Use Volatility Filter (ATR %)", group="Filters")
-float  minAtrPct        = input.float(0.10, "Min ATR % of price", minval=0.0, step=0.05, group="Filters")
-float  maxAtrPct        = input.float(5.0,  "Max ATR % of price", minval=0.0, step=0.10, group="Filters")
+float  minAtrPct        = input.float(0.10, "Min ATR % of Price", minval=0.0, step=0.05, group="Filters")
+float  maxAtrPct        = input.float(5.0, "Max ATR % of Price (0 = off)", minval=0.0, step=0.10, group="Filters")
 
-// --- Risk Management ---
-float riskLowPct       = input.float(1.0, "Risk % - Single Signal",     minval=0.05, maxval=5.0, step=0.05, group="Risk Management")
+// ---------------- Risk Management ----------------
+float riskLowPct       = input.float(1.0, "Risk % - Single Signal", minval=0.05, maxval=5.0, step=0.05, group="Risk Management")
 float riskHighPct      = input.float(2.0, "Risk % - Confluence Signal", minval=0.05, maxval=5.0, step=0.05, group="Risk Management")
-float targetR          = input.float(3.0, "Target (R multiple)",        minval=0.5,  step=0.1, group="Risk Management")
-bool  useDynamicTarget = input.bool(false, "Use Swing High/Low as Target", group="Risk Management")
-bool  bosBoostsRisk    = input.bool(true, "Fresh BOS boosts risk to high tier", group="Risk Management")
-int   bosMemoryBars    = input.int(20, "BOS memory (bars)", minval=1, group="Risk Management")
-
+bool  bosBoostsRisk    = input.bool(true, "Fresh BOS Boosts Risk to High Tier", group="Risk Management")
+float targetR          = input.float(3.0, "Fixed Target (R multiple)", minval=0.5, step=0.1, group="Risk Management")
+bool  useDynamicTarget = input.bool(false, "Use Swing High/Low as Target", group="Risk Management",
+     tooltip="Uses the latest confirmed swing if it is ahead of the expected entry, even when nearer than the fixed-R target. Otherwise falls back to fixed R. Rejects targets below the minimum acceptable R.")
+float minTargetR       = input.float(1.0, "Minimum Acceptable Target (R)", minval=0.1, step=0.1, group="Risk Management")
 float slBufferATRmult  = input.float(0.25, "Stop-Loss Buffer (x ATR)", minval=0.0, step=0.05, group="Risk Management")
-int   atrLength        = input.int(14, "ATR Length",                   minval=1, group="Risk Management")
-float minSLpct         = input.float(0.0, "Min SL Distance (% of price, 0 = off)", minval=0.0, step=0.05, group="Risk Management")
-float maxSLpct         = input.float(5.0, "Max SL Distance (% of price, 0 = off)", minval=0.0, step=0.1, group="Risk Management")
-bool  roundQty         = input.bool(false, "Round Quantity (stocks/futures)", group="Risk Management")
-bool  useBreakEven     = input.bool(true, "Move SL to Break-Even",     group="Risk Management")
-float beTriggerR       = input.float(1.0, "BE Trigger (R multiple)",   minval=0.1, step=0.1, group="Risk Management")
-bool  useTrailing      = input.bool(false, "Use Trailing Stop",        group="Risk Management")
-float trailATRmult     = input.float(1.5, "Trailing Distance (x ATR)", minval=0.1, step=0.1, group="Risk Management")
+int   atrLength        = input.int(14, "ATR Length", minval=1, group="Risk Management")
+float minSLpct         = input.float(0.0, "Min SL Distance (% of Entry, 0 = off)", minval=0.0, step=0.05, group="Risk Management")
+float maxSLpct         = input.float(5.0, "Max SL Distance (% of Entry, 0 = off)", minval=0.0, step=0.1, group="Risk Management")
+bool  includeSignalWick = input.bool(true, "Place Stop Beyond Entry Candle Wick", group="Risk Management",
+     tooltip="Also protects the rejection/sweep wick. With multiple triggering zones, the stop always uses the outer boundary of all those zones.")
+bool  roundQty         = input.bool(false, "Round Quantity to Whole Units", group="Risk Management")
+float qtyStepInput     = input.float(0.0, "Quantity Step (0 = Symbol Minimum)", minval=0.0, group="Risk Management",
+     tooltip="Defaults to syminfo.mincontract. Override to match your broker's quantity increment; symbol minimum and broker step are not always identical.")
+float maxExposurePct   = input.float(100.0, "Max Position Notional (% of Equity, 0 = off)", minval=0.0, step=10.0, group="Risk Management",
+     tooltip="Caps size as well as the risk budget. Default is unlevered, matching 100% margin in Strategy Properties. Leveraged tests require compatible margin and exposure settings.")
+bool  includeCostsInRisk = input.bool(true, "Budget Estimated Costs in Position Risk", group="Risk Management")
+int   sizingSlippageTicks = input.int(2, "Sizing Slippage (ticks; Match Properties)", minval=0, group="Risk Management")
+float sizingCommissionPct = input.float(0.02, "Sizing Commission % per Side (Match Properties)", minval=0.0, step=0.01, group="Risk Management",
+     tooltip="These estimates do NOT change Strategy Properties. Defaults match the declaration: 2 ticks and 0.02% per side. Cost budgeting includes entry/stop slippage and percentage commission, not price gaps.")
 
-// --- Global Risk Guard ---
-float maxDailyLossPct = input.float(0.0, "Max Daily Loss % (0 = off)", minval=0.0, step=0.1, group="Risk Management")
-bool  dailyLossFlatten = input.bool(true, "Flatten on Daily Loss Hit", group="Risk Management")
+// ---------------- Trade Management ----------------
+bool  exitOnZoneInvalidation = input.bool(true, "Exit if an Original Entry Zone Invalidates", group="Trade Management")
+bool  useBreakEven      = input.bool(true, "Move SL to Entry Price (Gross Break-Even)", group="Trade Management")
+float beTriggerR        = input.float(1.0, "BE Trigger (R multiple)", minval=0.1, step=0.1, group="Trade Management")
+bool  useTrailing       = input.bool(false, "Use Trailing Stop", group="Trade Management")
+float trailTriggerR     = input.float(1.0, "Start Trailing After Profit (R)", minval=0.0, step=0.1, group="Trade Management")
+float trailATRmult      = input.float(1.5, "Trailing Distance (x ATR)", minval=0.1, step=0.1, group="Trade Management")
+bool  confirmManagementOnClose = input.bool(true, "Confirm BE/Trailing Activation on Close", group="Trade Management",
+     tooltip="If disabled, a wick can activate management, but the new stop still only takes effect at bar close. A stop already crossed by that close causes a market exit, not a retroactive fill at the stop.")
 
-// ---------------- Colors ----------------
+// ---------------- Daily Guard / Alerts ----------------
+float maxDailyLossPct  = input.float(0.0, "Max Daily Loss % (0 = off)", minval=0.0, maxval=100.0, step=0.1, group="Risk Management")
+bool  dailyLossFlatten = input.bool(true, "Flatten on Daily Loss Hit", group="Risk Management",
+     tooltip="Checks equity at bar close, including open P&L, against the previous close at the start of the trading day. Once hit, entries stay locked until the next trading day, even if equity recovers. Not an intrabar hard loss cap.")
+bool  enableSignalAlerts = input.bool(false, "Enable Order-Submission Alerts", group="Alerts",
+     tooltip="Optional alert() calls for entry/market-exit submissions; these are NOT fill confirmations. Use order-fill alerts for executions.")
+bool  enableRiskAlerts = input.bool(true, "Enable Daily-Loss Alert", group="Alerts")
+
+// ---------------- Input Validation ----------------
+if barstate.isfirst
+    if useHtfFilter and (na(timeframe.in_seconds()) or timeframe.in_seconds(htfTimeframe) <= timeframe.in_seconds())
+        runtime.error("HTF Timeframe must be strictly higher than the chart timeframe on a time-based chart.")
+    if useSessionFilter and not timeframe.isintraday
+        runtime.error("The session filter requires an intraday chart.")
+    if useDateFilter and startDateIn > endDateIn
+        runtime.error("Start Date must not be after End Date.")
+    if useVolFilter and maxAtrPct > 0 and minAtrPct > maxAtrPct
+        runtime.error("Min ATR % must not exceed Max ATR %.")
+    if maxSLpct > 0 and minSLpct > maxSLpct
+        runtime.error("Min SL Distance must not exceed Max SL Distance.")
+    if minTargetR > targetR
+        runtime.error("Minimum Acceptable Target must not exceed the Fixed Target R used as fallback.")
+    if maxDailyLossPct > 0 and not (timeframe.isintraday or timeframe.isdaily)
+        runtime.error("The daily loss guard requires an intraday or daily chart.")
+
+// ---------------- Zone Lifecycle ----------------
+// Still one zone per side/type. Objects centralize cleanup, age, and consumption.
+// Chart boxes can start on an earlier source candle; a zone is only KNOWABLE at createdBar.
+type Zone
+    float top = na
+    float bottom = na
+    int createdBar = na
+    bool used = false
+    box drawing = na
+
+method isActive(Zone this) =>
+    not na(this.top) and not na(this.bottom) and not na(this.createdBar)
+
+method clear(Zone this) =>
+    if not na(this.drawing)
+        box.delete(this.drawing)
+    this.top := na
+    this.bottom := na
+    this.createdBar := na
+    this.used := false
+    this.drawing := na
+    this
+
+method form(Zone this, float top, float bottom, int sourceBar, color zoneColor, int transparency) =>
+    this.clear()
+    this.top := top
+    this.bottom := bottom
+    this.createdBar := bar_index
+    this.drawing := box.new(sourceBar, top, bar_index + 1, bottom,
+         border_color=zoneColor, bgcolor=color.new(zoneColor, transparency))
+    this
+
+method maintain(Zone this, bool bullish) =>
+    if this.isActive()
+        bool invalidated = barstate.isconfirmed and (bullish ? close < this.bottom : close > this.top)
+        bool expired = maxZoneAgeBars > 0 and bar_index - this.createdBar > maxZoneAgeBars
+        if invalidated or expired
+            this.clear()
+        else if not na(this.drawing)
+            box.set_right(this.drawing, bar_index + 1)
+    this
+
+method retest(Zone this, bool bullish) =>
+    // Range intersection accepts wick sweeps followed by a valid rejection close.
+    this.isActive() and bar_index > this.createdBar and (not oneTradePerZone or not this.used) and
+         low <= this.top and high >= this.bottom and
+         (not requireRejection or (bullish ? close > this.top : close < this.bottom))
+
+method consume(Zone this) =>
+    this.used := true
+    if oneTradePerZone and not na(this.drawing)
+        box.set_border_color(this.drawing, color.gray)
+        box.set_bgcolor(this.drawing, color.new(color.gray, 92))
+    this
+
+f_overlapRetest(Zone first, Zone second) =>
+    float overlapTop = math.min(first.top, second.top)
+    float overlapBottom = math.max(first.bottom, second.bottom)
+    first.isActive() and second.isActive() and overlapTop > overlapBottom and
+         low <= overlapTop and high >= overlapBottom
+
+// ---------------- Price / Size Helpers ----------------
+f_floorPrice(float price) =>
+    math.floor(price / syminfo.mintick) * syminfo.mintick
+
+f_ceilPrice(float price) =>
+    math.ceil(price / syminfo.mintick) * syminfo.mintick
+
+f_stopPrice(int direction, float price) =>
+    direction == 1 ? f_floorPrice(price) : f_ceilPrice(price)
+
+f_fixedTarget(int direction, float entryPrice, float riskDistance) =>
+    // Round away from entry so tick rounding cannot reduce the requested fixed R.
+    float price = entryPrice + direction * riskDistance * targetR
+    direction == 1 ? f_ceilPrice(price) : f_floorPrice(price)
+
+f_positionSize(int direction, float entryPrice, float stopPrice, float riskPct) =>
+    float exitSlippage = sizingSlippageTicks * syminfo.mintick
+    float estimatedStopFill = stopPrice - direction * exitSlippage
+    float commissionDistance = (math.abs(entryPrice) + math.abs(estimatedStopFill)) * sizingCommissionPct / 100.0
+    float costDistance = includeCostsInRisk ? exitSlippage + commissionDistance : 0.0
+    // Convert SYMBOL-currency loss for ONE unit/contract into ACCOUNT currency.
+    float riskPerUnit = strategy.convert_to_account((math.abs(entryPrice - stopPrice) + costDistance) * syminfo.pointvalue)
+    float fullStopRiskPerUnit = strategy.convert_to_account((math.abs(entryPrice - stopPrice) + exitSlippage + commissionDistance) * syminfo.pointvalue)
+    float notionalPerUnit = strategy.convert_to_account(math.abs(entryPrice) * syminfo.pointvalue)
+    float step = qtyStepInput > 0 ? qtyStepInput : nz(syminfo.mincontract, 1.0)
+    step := roundQty ? math.max(1.0, math.ceil(step)) : step
+    float qty = 0.0
+    if strategy.equity > 0 and syminfo.pointvalue > 0 and step > 0 and not na(riskPerUnit) and riskPerUnit > 0 and
+         not na(fullStopRiskPerUnit) and fullStopRiskPerUnit > 0 and not na(notionalPerUnit) and notionalPerUnit > 0
+        qty := strategy.equity * riskPct / 100.0 / riskPerUnit
+        if maxExposurePct > 0
+            // Cover entry commission. A 100%-margin short also needs headroom
+            // for BOTH equity loss and increased notional as price rises.
+            // This conservative reserve protects the unlevered default; it
+            // does not infer changed margin/leverage settings from Properties.
+            float capitalPerUnit = notionalPerUnit * (1.0 + sizingCommissionPct / 100.0) + (direction == -1 ? 2.0 * fullStopRiskPerUnit : 0.0)
+            float exposureQty = strategy.equity * maxExposurePct / 100.0 / capitalPerUnit
+            qty := math.min(qty, exposureQty)
+        qty := math.floor(qty / step) * step
+    qty
+
+// ---------------- State / Indicators ----------------
 color bullColor = color.blue
 color bearColor = color.red
+var Zone bullFvg = Zone.new()
+var Zone bearFvg = Zone.new()
+var Zone bullOb = Zone.new()
+var Zone bearOb = Zone.new()
 
-// ---------------- State ----------------
-var bool justEntered = false
-
-// FVG state (single zone per side, matching original behavior)
-var float bullFvgTop    = na
-var float bullFvgBottom = na
-var bool  bullFvgActive = false
-var box   bullFvgBox    = na
-
-var float bearFvgTop    = na
-var float bearFvgBottom = na
-var bool  bearFvgActive = false
-var box   bearFvgBox    = na
-
-// OB state
-var float bullObTop    = na
-var float bullObBottom = na
-var bool  bullObActive = false
-var box   bullObBox    = na
-
-var float bearObTop    = na
-var float bearObBottom = na
-var bool  bearObActive = false
-var box   bearObBox    = na
-
-// Structure
-var float swingHigh     = na
-var float swingLow      = na
+var float swingHigh = na
+var float swingLow = na
 var float lastSwingHigh = na
-var float lastSwingLow  = na
-
-var bool bullishBOS = false
-var bool bearishBOS = false
-
-// BOS memory
+var float lastSwingLow = na
 var int lastBullBOSBar = na
 var int lastBearBOSBar = na
 
-// Trade management state
-var float longStop      = na
-var float longLimit     = na
-var float longInitRisk  = na
-var bool  longFromFvg   = false
-var bool  longFromOb    = false
+// A trade's zone boundaries are frozen at submission; replacement/expiry of a
+// displayed zone must NEVER change the invalidation rules for an open trade.
+var int tradeDirection = 0
+var int tradeEntryBar = na
+var float tradeFvgBoundary = na
+var float tradeObBoundary = na
+var float tradeStop = na
+var float tradeLimit = na
+var float tradeInitRisk = na
+var float tradeBestPrice = na
+var bool tradeUsesSwingTarget = false
+var bool tradeEntryReconciled = false
+var bool tradeTrailingActive = false
 
-var float shortStop      = na
-var float shortLimit     = na
-var float shortInitRisk  = na
-var bool  shortFromFvg   = false
-var bool  shortFromOb    = false
-
-// Alert flags (set only when a real order was submitted)
-var bool longEntryFired  = false
-var bool shortEntryFired = false
-var bool longExitFired   = false
-var bool shortExitFired  = false
-
-// Indicators
 float atr = ta.atr(atrLength)
 float ema = ta.ema(close, emaLength)
+float pivotHigh = ta.pivothigh(high, swingLength, swingLength)
+float pivotLow = ta.pivotlow(low, swingLength, swingLength)
 
-float htfEma = useHtfFilter
-     ? request.security(syminfo.tickerid, htfTimeframe, ta.ema(close, htfEmaLength), lookahead=barmerge.lookahead_off)
-     : na
+float htfEma = na
+if useHtfFilter
+    // [1] + lookahead_on returns the LAST CLOSED HTF bar, not future data.
+    // lookahead_off alone would still expose a developing HTF EMA in realtime.
+    htfEma := request.security(syminfo.tickerid, htfTimeframe, ta.ema(close, htfEmaLength)[1],
+         gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
 
-// ---------------- Session / Date / Volatility Filters ----------------
-bool inSession   = not useSessionFilter or not na(time(timeframe.period, sessionStr))
-bool inDateRange = not useDateFilter or (time >= startDateIn and time <= endDateIn)
+// Reset BEFORE evaluating new orders, not after them. No entry latch is needed.
+if strategy.position_size == 0
+    tradeDirection := 0
+    tradeEntryBar := na
+    tradeFvgBoundary := na
+    tradeObBoundary := na
+    tradeStop := na
+    tradeLimit := na
+    tradeInitRisk := na
+    tradeBestPrice := na
+    tradeUsesSwingTarget := false
+    tradeEntryReconciled := false
+    tradeTrailingActive := false
 
-float atrPct = atr / close * 100.0
-bool  volOk  = not useVolFilter or (atrPct >= minAtrPct and (maxAtrPct <= 0.0 or atrPct <= maxAtrPct))
+bool longEntryFired = false
+bool shortEntryFired = false
+bool marketExitFired = false
+
+// ---------------- Entry Filters ----------------
+int sessionBarOpen = time(timeframe.period, sessionStr)
+int sessionBarClose = time_close(timeframe.period, sessionStr)
+bool inSession = not useSessionFilter or (not na(sessionBarOpen) and not na(sessionBarClose) and not na(time_close) and time_close <= sessionBarClose)
+bool inDateRange = not useDateFilter or (time >= startDateIn and not na(time_close) and time_close <= endDateIn)
+float atrPct = close > 0 ? atr / close * 100.0 : na
+bool volOk = not useVolFilter or (not na(atrPct) and atrPct >= minAtrPct and (maxAtrPct <= 0.0 or atrPct <= maxAtrPct))
+bool indicatorsReady = close > 0 and syminfo.mintick > 0 and not na(atr) and atr > 0
+bool trendOkLong = not useTrendFilter or (bar_index >= emaLength - 1 and not na(ema) and close > ema)
+bool trendOkShort = not useTrendFilter or (bar_index >= emaLength - 1 and not na(ema) and close < ema)
+// Enabled HTF filter fails CLOSED when no confirmed value is available.
+bool htfOkLong = not useHtfFilter or (not na(htfEma) and close > htfEma)
+bool htfOkShort = not useHtfFilter or (not na(htfEma) and close < htfEma)
+int lastExitBar = strategy.closedtrades > 0 ? strategy.closedtrades.exit_bar_index(strategy.closedtrades - 1) : na
+bool cooldownOk = na(lastExitBar) or bar_index - lastExitBar > cooldownBars
 
 // ---------------- Daily Loss Guard ----------------
-var float dayStartEquity = strategy.initial_capital
-if na(dayofmonth[1]) or dayofmonth != dayofmonth[1]
-    dayStartEquity := strategy.equity
+var float dayStartEquity = na
+var bool dailyLossLocked = false
+// time_tradingday follows overnight sessions and also distinguishes month/year changes.
+bool newTradingDay = barstate.isfirst or time_tradingday != time_tradingday[1]
+if newTradingDay
+    // Using the prior close includes the first bar's gap/mark-to-market loss.
+    dayStartEquity := nz(strategy.equity[1], strategy.initial_capital)
+    dailyLossLocked := false
+bool dailyLossJustHit = false
+if barstate.isconfirmed and maxDailyLossPct > 0 and not dailyLossLocked and not na(dayStartEquity) and dayStartEquity > 0
+    float dayPnLPct = (strategy.equity - dayStartEquity) / dayStartEquity * 100.0
+    if dayPnLPct <= -maxDailyLossPct
+        dailyLossLocked := true
+        dailyLossJustHit := true
 
-bool dailyLossHit = false
-if maxDailyLossPct > 0 and not na(dayStartEquity) and dayStartEquity > 0
-    float dayPnLpct = (strategy.equity - dayStartEquity) / dayStartEquity * 100.0
-    dailyLossHit := dayPnLpct <= -maxDailyLossPct
+bool canTrade = indicatorsReady and inSession and inDateRange and volOk and cooldownOk and not dailyLossLocked
 
-if dailyLossHit and dailyLossFlatten and strategy.position_size != 0
-    strategy.close_all(comment="Daily Loss Limit")
-
-bool canTrade = inSession and inDateRange and volOk and not dailyLossHit
-
-// ---------------- Swing / Structure ----------------
-float pivotHigh = ta.pivothigh(high, swingLength, swingLength)
-float pivotLow  = ta.pivotlow(low,  swingLength, swingLength)
-
+// ---------------- Confirmed Swing Structure ----------------
 if barstate.isconfirmed and not na(pivotHigh)
-    swingHigh     := pivotHigh
+    swingHigh := pivotHigh
     lastSwingHigh := pivotHigh
 if barstate.isconfirmed and not na(pivotLow)
-    swingLow     := pivotLow
+    swingLow := pivotLow
     lastSwingLow := pivotLow
 
-bullishBOS := false
-bearishBOS := false
-
-if barstate.isconfirmed and not na(swingHigh) and close > swingHigh and close[1] <= swingHigh
-    bullishBOS     := true
+bool bullishBOS = barstate.isconfirmed and not na(swingHigh) and close > swingHigh and close[1] <= swingHigh
+bool bearishBOS = barstate.isconfirmed and not na(swingLow) and close < swingLow and close[1] >= swingLow
+if bullishBOS
     lastBullBOSBar := bar_index
-    swingHigh      := na
-if barstate.isconfirmed and not na(swingLow) and close < swingLow and close[1] >= swingLow
-    bearishBOS     := true
+    swingHigh := na
+if bearishBOS
     lastBearBOSBar := bar_index
-    swingLow       := na
+    swingLow := na
 
-bool recentBullBOS = not na(lastBullBOSBar) and (bar_index - lastBullBOSBar) <= bosMemoryBars
-bool recentBearBOS = not na(lastBearBOSBar) and (bar_index - lastBearBOSBar) <= bosMemoryBars
+// An opposite BOS immediately supersedes old risk/bias memory.
+bool recentBullBOS = not na(lastBullBOSBar) and bar_index - lastBullBOSBar <= bosMemoryBars and (na(lastBearBOSBar) or lastBullBOSBar > lastBearBOSBar)
+bool recentBearBOS = not na(lastBearBOSBar) and bar_index - lastBearBOSBar <= bosMemoryBars and (na(lastBullBOSBar) or lastBearBOSBar > lastBullBOSBar)
 
-// ---------------- FVG Detection (single zone, original behavior) ----------------
-bool bullFvgInvalidated = false
-bool bearFvgInvalidated = false
+// Maintain previously known zones BEFORE retests. New zones are formed only
+// AFTER all trade decisions, so they cannot replace the zone used for this bar.
+bullFvg.maintain(true)
+bearFvg.maintain(false)
+bullOb.maintain(true)
+bearOb.maintain(false)
 
-if useFVG
-    bool bullFvgFormed = barstate.isconfirmed and low  > high[2]
-    bool bearFvgFormed = barstate.isconfirmed and high < low[2]
+// ---------------- Open Trade Management ----------------
+// Entry filters never disable protective exits. Daily flatten has priority.
+if barstate.isconfirmed and strategy.position_size != 0
+    int positionDirection = strategy.position_size > 0 ? 1 : -1
+    float entryPrice = strategy.position_avg_price
+    if dailyLossLocked and dailyLossFlatten
+        strategy.close_all(comment="Daily Loss Limit", immediately=true, alert_message="SMC Exit: Daily Loss Limit")
+        marketExitFired := true
+    else
+        if not tradeEntryReconciled
+            // Reconcile R to the emulator's actual fill without enabling
+            // calc_on_order_fills (which can introduce historical-bar hindsight).
+            tradeInitRisk := positionDirection * (entryPrice - tradeStop)
+            tradeBestPrice := entryPrice
+            if not tradeUsesSwingTarget and not na(tradeInitRisk) and tradeInitRisk > 0
+                tradeLimit := f_fixedTarget(positionDirection, entryPrice, tradeInitRisk)
+            tradeEntryReconciled := true
 
-    float bullGapSize = bullFvgFormed ? (low - high[2]) : na
-    float bearGapSize = bearFvgFormed ? (low[2] - high) : na
+        bool invalidRiskState = tradeDirection != positionDirection or na(tradeStop) or na(tradeLimit) or na(tradeInitRisk) or tradeInitRisk <= 0 or tradeLimit <= 0
+        if not invalidRiskState and bar_index > tradeEntryBar
+            float favorablePrice = positionDirection == 1 ? high : low
+            tradeBestPrice := positionDirection == 1 ? math.max(tradeBestPrice, favorablePrice) : math.min(tradeBestPrice, favorablePrice)
+            float triggerPrice = confirmManagementOnClose ? close : favorablePrice
+            float favorableMove = positionDirection * (triggerPrice - entryPrice)
+            if useBreakEven and favorableMove >= beTriggerR * tradeInitRisk
+                tradeStop := positionDirection == 1 ? math.max(tradeStop, f_ceilPrice(entryPrice)) : math.min(tradeStop, f_floorPrice(entryPrice))
+            if useTrailing
+                tradeTrailingActive := tradeTrailingActive or favorableMove >= trailTriggerR * tradeInitRisk
+                if tradeTrailingActive and not na(atr)
+                    float trailingStop = f_stopPrice(positionDirection, tradeBestPrice - positionDirection * trailATRmult * atr)
+                    tradeStop := positionDirection == 1 ? math.max(tradeStop, trailingStop) : math.min(tradeStop, trailingStop)
 
-    bool bullFvgValid = bullFvgFormed and (fvgMinGapPct <= 0.0 or (bullGapSize / close * 100) >= fvgMinGapPct)
-    bool bearFvgValid = bearFvgFormed and (fvgMinGapPct <= 0.0 or (bearGapSize / close * 100) >= fvgMinGapPct)
+        bool zoneInvalidated = exitOnZoneInvalidation and ((not na(tradeFvgBoundary) and positionDirection * (close - tradeFvgBoundary) < 0) or
+             (not na(tradeObBoundary) and positionDirection * (close - tradeObBoundary) < 0))
+        bool managedStopCrossed = not na(tradeStop) and positionDirection * (close - tradeStop) <= 0
+        bool swingTargetTooClose = tradeUsesSwingTarget and not invalidRiskState and positionDirection * (tradeLimit - entryPrice) / tradeInitRisk < minTargetR
+        string exitReason = invalidRiskState ? "Invalid Risk State" : zoneInvalidated ? "Entry Zone Invalidated" : swingTargetTooClose ? "Swing Target Below Minimum R" : managedStopCrossed ? "Managed Stop Crossed" : ""
+        if exitReason != ""
+            // A newly tightened stop already crossed at this close is NOT
+            // allowed to claim an earlier/better stop-price fill on this bar.
+            if positionDirection == 1
+                strategy.close("Long", comment=exitReason, immediately=true, alert_message="SMC Long Exit: " + exitReason)
+            else
+                strategy.close("Short", comment=exitReason, immediately=true, alert_message="SMC Short Exit: " + exitReason)
+            marketExitFired := true
+        else if positionDirection == 1
+            strategy.exit("Long Exit", "Long", stop=tradeStop, limit=tradeLimit, comment="Long SL/TP", alert_message="SMC Long Exit: SL/TP")
+        else
+            strategy.exit("Short Exit", "Short", stop=tradeStop, limit=tradeLimit, comment="Short SL/TP", alert_message="SMC Short Exit: SL/TP")
 
-    if bullFvgValid
-        if bullFvgActive and not na(bullFvgBox)
-            box.delete(bullFvgBox)
-        bullFvgTop    := low
-        bullFvgBottom := high[2]
-        bullFvgActive := true
-        bullFvgBox    := box.new(bar_index[2], bullFvgTop, bar_index, bullFvgBottom,
-             border_color=bullColor, bgcolor=color.new(bullColor, 85))
+// ---------------- Retest / Signal Grading ----------------
+bool priceInBullFvg = useFVG and bullFvg.retest(true)
+bool priceInBearFvg = useFVG and bearFvg.retest(false)
+bool priceInBullOb = useOB and bullOb.retest(true)
+bool priceInBearOb = useOB and bearOb.retest(false)
 
-    if bearFvgValid
-        if bearFvgActive and not na(bearFvgBox)
-            box.delete(bearFvgBox)
-        bearFvgTop    := low[2]
-        bearFvgBottom := high
-        bearFvgActive := true
-        bearFvgBox    := box.new(bar_index[2], bearFvgTop, bar_index, bearFvgBottom,
-             border_color=bearColor, bgcolor=color.new(bearColor, 85))
-
-    bullFvgInvalidated := bullFvgActive and barstate.isconfirmed and not na(bullFvgBottom) and close < bullFvgBottom
-    bearFvgInvalidated := bearFvgActive and barstate.isconfirmed and not na(bearFvgTop)    and close > bearFvgTop
-
-    if bullFvgInvalidated
-        bullFvgActive := false
-        if not na(bullFvgBox)
-            box.delete(bullFvgBox)
-            bullFvgBox := na
-        bullFvgTop    := na
-        bullFvgBottom := na
-
-    if bearFvgInvalidated
-        bearFvgActive := false
-        if not na(bearFvgBox)
-            box.delete(bearFvgBox)
-            bearFvgBox := na
-        bearFvgTop    := na
-        bearFvgBottom := na
-
-if bullFvgActive and not na(bullFvgBox)
-    box.set_right(bullFvgBox, bar_index + 1)
-if bearFvgActive and not na(bearFvgBox)
-    box.set_right(bearFvgBox, bar_index + 1)
-
-// ---------------- Order Block Detection (single zone, original behavior) ----------------
-bool bullObInvalidated = false
-bool bearObInvalidated = false
-
-if useOB
-    bool strongBullMove = barstate.isconfirmed and close > high[1] and close[1] < open[1] and (close - open) > (high[1] - low[1])
-    bool strongBearMove = barstate.isconfirmed and close < low[1]  and close[1] > open[1] and (open - close) > (high[1] - low[1])
-
-    if strongBullMove
-        if bullObActive and not na(bullObBox)
-            box.delete(bullObBox)
-        bullObTop    := open[1]
-        bullObBottom := low[1]
-        bullObActive := true
-        bullObBox    := box.new(bar_index[1], bullObTop, bar_index, bullObBottom,
-             border_color=bullColor, bgcolor=color.new(bullColor, 90))
-
-    if strongBearMove
-        if bearObActive and not na(bearObBox)
-            box.delete(bearObBox)
-        bearObTop    := high[1]
-        bearObBottom := open[1]
-        bearObActive := true
-        bearObBox    := box.new(bar_index[1], bearObTop, bar_index, bearObBottom,
-             border_color=bearColor, bgcolor=color.new(bearColor, 90))
-
-    bullObInvalidated := bullObActive and barstate.isconfirmed and not na(bullObBottom) and close < bullObBottom
-    bearObInvalidated := bearObActive and barstate.isconfirmed and not na(bearObTop)    and close > bearObTop
-
-    if bullObInvalidated
-        bullObActive := false
-        if not na(bullObBox)
-            box.delete(bullObBox)
-            bullObBox := na
-        bullObTop    := na
-        bullObBottom := na
-
-    if bearObInvalidated
-        bearObActive := false
-        if not na(bearObBox)
-            box.delete(bearObBox)
-            bearObBox := na
-        bearObTop    := na
-        bearObBottom := na
-
-if bullObActive and not na(bullObBox)
-    box.set_right(bullObBox, bar_index + 1)
-if bearObActive and not na(bearObBox)
-    box.set_right(bearObBox, bar_index + 1)
-
-// ---------------- Entry Conditions (original touch logic) ----------------
-bool priceInBullFvg = useFVG and bullFvgActive and not na(bullFvgTop) and not na(bullFvgBottom) and low  <= bullFvgTop and low  >= bullFvgBottom
-bool priceInBearFvg = useFVG and bearFvgActive and not na(bearFvgTop) and not na(bearFvgBottom) and high >= bearFvgBottom and high <= bearFvgTop
-
-bool priceInBullOb  = useOB  and bullObActive  and not na(bullObTop)  and not na(bullObBottom)  and low  <= bullObTop  and low  >= bullObBottom
-bool priceInBearOb  = useOB  and bearObActive  and not na(bearObTop)  and not na(bearObBottom)  and high >= bearObBottom and high <= bearObTop
-
-// Trend filters
-bool trendOkLong  = not useTrendFilter or close > ema
-bool trendOkShort = not useTrendFilter or close < ema
-
-bool htfOkLong  = not useHtfFilter or na(htfEma) or close > htfEma
-bool htfOkShort = not useHtfFilter or na(htfEma) or close < htfEma
-
-bool longCondition  = barstate.isconfirmed and strategy.position_size == 0 and canTrade and trendOkLong  and htfOkLong  and (priceInBullFvg or priceInBullOb) and close > open
-bool shortCondition = barstate.isconfirmed and strategy.position_size == 0 and canTrade and trendOkShort and htfOkShort and (priceInBearFvg or priceInBearOb) and close < open
-
-// --- Signal Quality Grading ---
-bool longConfluence  = priceInBullFvg and priceInBullOb
-bool shortConfluence = priceInBearFvg and priceInBearOb
-
-bool longStrong  = longConfluence  or (bosBoostsRisk and recentBullBOS)
+// Touching two disjoint zones with a wide candle is NOT spatial confluence.
+bool longConfluence = priceInBullFvg and priceInBullOb and f_overlapRetest(bullFvg, bullOb)
+bool shortConfluence = priceInBearFvg and priceInBearOb and f_overlapRetest(bearFvg, bearOb)
+bool longStrong = longConfluence or (bosBoostsRisk and recentBullBOS)
 bool shortStrong = shortConfluence or (bosBoostsRisk and recentBearBOS)
 
-float longRiskPct  = longStrong  ? riskHighPct : riskLowPct
-float shortRiskPct = shortStrong ? riskHighPct : riskLowPct
+bool longCondition = barstate.isconfirmed and strategy.position_size == 0 and canTrade and trendOkLong and htfOkLong and
+     (not requireRecentBOS or recentBullBOS) and (priceInBullFvg or priceInBullOb) and close > open
+bool shortCondition = barstate.isconfirmed and strategy.position_size == 0 and canTrade and trendOkShort and htfOkShort and
+     (not requireRecentBOS or recentBearBOS) and (priceInBearFvg or priceInBearOb) and close < open
 
-// ---------------- Entry (with same-bar protection) ----------------
-longEntryFired  := false
-shortEntryFired := false
+// ---------------- Risk-Checked Entry + Immediate Bracket ----------------
+// One shared path keeps long/short sizing, validation, and snapshots symmetric.
+int signalDirection = longCondition ? 1 : shortCondition ? -1 : 0
+if signalDirection != 0
+    bool fromFvg = signalDirection == 1 ? priceInBullFvg : priceInBearFvg
+    bool fromOb = signalDirection == 1 ? priceInBullOb : priceInBearOb
+    float fvgBoundary = fromFvg ? (signalDirection == 1 ? bullFvg.bottom : bearFvg.top) : na
+    float obBoundary = fromOb ? (signalDirection == 1 ? bullOb.bottom : bearOb.top) : na
+    float baseStop = fromFvg ? fvgBoundary : obBoundary
+    if fromFvg and fromOb
+        baseStop := signalDirection == 1 ? math.min(fvgBoundary, obBoundary) : math.max(fvgBoundary, obBoundary)
+    if includeSignalWick
+        baseStop := signalDirection == 1 ? math.min(baseStop, low) : math.max(baseStop, high)
 
-if longCondition
-    justEntered := true
-    longFromFvg := priceInBullFvg
-    longFromOb  := priceInBullOb
+    float expectedEntry = close + signalDirection * sizingSlippageTicks * syminfo.mintick
+    float plannedStop = f_stopPrice(signalDirection, baseStop - signalDirection * slBufferATRmult * atr)
+    float riskDistance = signalDirection * (expectedEntry - plannedStop)
+    float slPct = expectedEntry > 0 ? riskDistance / expectedEntry * 100.0 : na
+    float swingTarget = signalDirection == 1 ? lastSwingHigh : lastSwingLow
+    bool hasSwingTarget = useDynamicTarget and not na(swingTarget) and signalDirection * (swingTarget - expectedEntry) > 0
+    float plannedLimit = hasSwingTarget ? (signalDirection == 1 ? f_floorPrice(swingTarget) : f_ceilPrice(swingTarget)) : f_fixedTarget(signalDirection, expectedEntry, riskDistance)
+    float rewardR = riskDistance > 0 ? signalDirection * (plannedLimit - expectedEntry) / riskDistance : na
+    bool planOk = expectedEntry > 0 and plannedStop > 0 and plannedLimit > 0 and riskDistance > 0 and not na(rewardR) and rewardR >= minTargetR and
+         (minSLpct <= 0.0 or slPct >= minSLpct) and (maxSLpct <= 0.0 or slPct <= maxSLpct)
+    float riskPct = (signalDirection == 1 ? longStrong : shortStrong) ? riskHighPct : riskLowPct
+    float qty = planOk ? f_positionSize(signalDirection, expectedEntry, plannedStop, riskPct) : 0.0
 
-    // Use the tighter (higher) stop from the triggering zone(s)
-    float baseSL = na
-    if longFromFvg
-        baseSL := bullFvgBottom
-    if longFromOb
-        baseSL := na(baseSL) ? bullObBottom : math.max(baseSL, bullObBottom)
-    if na(baseSL)
-        baseSL := low
-
-    float slDist = (close - baseSL) + slBufferATRmult * atr
-    float slPct  = slDist / close * 100.0
-
-    bool slOk = slDist > 0 and (minSLpct <= 0.0 or slPct >= minSLpct) and (maxSLpct <= 0.0 or slPct <= maxSLpct)
-
-    if slOk
-        longStop     := close - slDist
-        longInitRisk := slDist
-
-        float rTarget = close + slDist * targetR
-        longLimit := rTarget
-        if useDynamicTarget and not na(lastSwingHigh) and lastSwingHigh > rTarget
-            longLimit := lastSwingHigh
-
-        float riskAmt = strategy.equity * (longRiskPct / 100.0)
-        float qty     = riskAmt / slDist
-        if roundQty
-            qty := math.floor(qty)
-
-        if qty > 0
-            strategy.entry("Long", strategy.long, qty=qty, comment="Long Entry")
-            // Same-bar protection — this is the one real fix from the previous version
-            strategy.exit("Long Exit", "Long", stop=longStop, limit=longLimit, comment="Long Exit")
+    // No state or zone is consumed when the stop/target/quantity is invalid.
+    if not na(qty) and qty > 0
+        tradeDirection := signalDirection
+        tradeEntryBar := bar_index
+        tradeFvgBoundary := fvgBoundary
+        tradeObBoundary := obBoundary
+        tradeStop := plannedStop
+        tradeLimit := plannedLimit
+        tradeInitRisk := riskDistance
+        tradeBestPrice := expectedEntry
+        tradeUsesSwingTarget := hasSwingTarget
+        tradeEntryReconciled := false
+        tradeTrailingActive := false
+        if signalDirection == 1
+            strategy.entry("Long", strategy.long, qty=qty, comment="Long Retest", alert_message="SMC Long Entry")
+            strategy.exit("Long Exit", "Long", stop=tradeStop, limit=tradeLimit, comment="Long SL/TP", alert_message="SMC Long Exit: SL/TP")
             longEntryFired := true
-
-if shortCondition
-    justEntered := true
-    shortFromFvg := priceInBearFvg
-    shortFromOb  := priceInBearOb
-
-    // Tighter (lower) stop from the triggering zone(s)
-    float baseSL = na
-    if shortFromFvg
-        baseSL := bearFvgTop
-    if shortFromOb
-        baseSL := na(baseSL) ? bearObTop : math.min(baseSL, bearObTop)
-    if na(baseSL)
-        baseSL := high
-
-    float slDist = (baseSL - close) + slBufferATRmult * atr
-    float slPct  = slDist / close * 100.0
-
-    bool slOk = slDist > 0 and (minSLpct <= 0.0 or slPct >= minSLpct) and (maxSLpct <= 0.0 or slPct <= maxSLpct)
-
-    if slOk
-        shortStop     := close + slDist
-        shortInitRisk := slDist
-
-        float rTarget = close - slDist * targetR
-        shortLimit := rTarget
-        if useDynamicTarget and not na(lastSwingLow) and lastSwingLow < rTarget
-            shortLimit := lastSwingLow
-
-        float riskAmt = strategy.equity * (shortRiskPct / 100.0)
-        float qty     = riskAmt / slDist
-        if roundQty
-            qty := math.floor(qty)
-
-        if qty > 0
-            strategy.entry("Short", strategy.short, qty=qty, comment="Short Entry")
-            strategy.exit("Short Exit", "Short", stop=shortStop, limit=shortLimit, comment="Short Exit")
+            if fromFvg
+                bullFvg.consume()
+            if fromOb
+                bullOb.consume()
+        else
+            strategy.entry("Short", strategy.short, qty=qty, comment="Short Retest", alert_message="SMC Short Entry")
+            strategy.exit("Short Exit", "Short", stop=tradeStop, limit=tradeLimit, comment="Short SL/TP", alert_message="SMC Short Exit: SL/TP")
             shortEntryFired := true
+            if fromFvg
+                bearFvg.consume()
+            if fromOb
+                bearOb.consume()
 
-// ---------------- Trade Management & Exits ----------------
-longExitFired  := false
-shortExitFired := false
+// ---------------- New Zones (Available FROM THE NEXT BAR) ----------------
+if barstate.isconfirmed
+    if useFVG
+        bool bullFvgFormed = not na(high[2]) and low > high[2]
+        bool bearFvgFormed = not na(low[2]) and high < low[2]
+        bool bullDisplacementOk = minDisplacementATR <= 0.0 or (not na(atr[1]) and close[1] > open[1] and close[1] - open[1] >= minDisplacementATR * atr[1])
+        bool bearDisplacementOk = minDisplacementATR <= 0.0 or (not na(atr[1]) and close[1] < open[1] and open[1] - close[1] >= minDisplacementATR * atr[1])
+        if bullFvgFormed and bullDisplacementOk and (fvgMinGapPct <= 0.0 or (low - high[2]) / close * 100.0 >= fvgMinGapPct)
+            bullFvg.form(low, high[2], bar_index - 2, bullColor, 85)
+        if bearFvgFormed and bearDisplacementOk and (fvgMinGapPct <= 0.0 or (low[2] - high) / close * 100.0 >= fvgMinGapPct)
+            bearFvg.form(low[2], high, bar_index - 2, bearColor, 85)
 
-if strategy.position_size > 0
-    float entry = strategy.position_avg_price
+    if useOB
+        // Retain the original simplified OB proxy: the prior opposing candle
+        // followed by an impulse body larger than that candle's full range.
+        bool strongBullMove = not na(high[1]) and close > high[1] and close[1] < open[1] and close - open > high[1] - low[1]
+        bool strongBearMove = not na(low[1]) and close < low[1] and close[1] > open[1] and open - close > high[1] - low[1]
+        bool bullDisplacementOk = minDisplacementATR <= 0.0 or (not na(atr) and close - open >= minDisplacementATR * atr)
+        bool bearDisplacementOk = minDisplacementATR <= 0.0 or (not na(atr) and open - close >= minDisplacementATR * atr)
+        if strongBullMove and bullDisplacementOk and (not requireObBOS or bullishBOS)
+            bullOb.form(open[1], low[1], bar_index - 1, bullColor, 90)
+        if strongBearMove and bearDisplacementOk and (not requireObBOS or bearishBOS)
+            bearOb.form(high[1], open[1], bar_index - 1, bearColor, 90)
 
-    if useBreakEven and not na(longInitRisk) and high >= entry + beTriggerR * longInitRisk
-        longStop := math.max(longStop, entry)
-    if useTrailing and not na(longStop)
-        longStop := math.max(longStop, close - trailATRmult * atr)
-
-    // Only close if the zone(s) that triggered this trade invalidated
-    bool longExitSignal = (longFromFvg and bullFvgInvalidated) or (longFromOb and bullObInvalidated)
-    if longExitSignal
-        strategy.close("Long", comment="Structure Invalidated")
-        longExitFired := true
-    else
-        strategy.exit("Long Exit", "Long", stop=longStop, limit=longLimit, comment="Long Exit")
-
-if strategy.position_size < 0
-    float entry = strategy.position_avg_price
-
-    if useBreakEven and not na(shortInitRisk) and low <= entry - beTriggerR * shortInitRisk
-        shortStop := math.min(shortStop, entry)
-    if useTrailing and not na(shortStop)
-        shortStop := math.min(shortStop, close + trailATRmult * atr)
-
-    bool shortExitSignal = (shortFromFvg and bearFvgInvalidated) or (shortFromOb and bearObInvalidated)
-    if shortExitSignal
-        strategy.close("Short", comment="Structure Invalidated")
-        shortExitFired := true
-    else
-        strategy.exit("Short Exit", "Short", stop=shortStop, limit=shortLimit, comment="Short Exit")
-
-// ---------------- Reset when flat (original justEntered latch) ----------------
-if strategy.position_size == 0 and not justEntered
-    longStop      := na
-    longLimit     := na
-    longInitRisk  := na
-    longFromFvg   := false
-    longFromOb    := false
-    shortStop      := na
-    shortLimit     := na
-    shortInitRisk  := na
-    shortFromFvg   := false
-    shortFromOb    := false
-
-// ---------------- Visuals ----------------
+// ---------------- Visuals / Working Strategy Alerts ----------------
 plot(useTrendFilter ? ema : na, "EMA Trend", color=color.orange, linewidth=1)
-plot(useHtfFilter ? htfEma : na, "HTF EMA", color=color.new(color.purple, 40), linewidth=1)
-
-plotshape(bullishBOS, title="Bullish BOS", style=shape.labelup,   location=location.belowbar, color=bullColor, text="BOS", textcolor=color.white, size=size.tiny)
+plot(useHtfFilter ? htfEma : na, "Confirmed HTF EMA", color=color.new(color.purple, 40), linewidth=1)
+plot(tradeStop, "Active Stop", color=color.red, linewidth=1, style=plot.style_linebr)
+plot(tradeLimit, "Active Target", color=color.green, linewidth=1, style=plot.style_linebr)
+plotshape(bullishBOS, title="Bullish BOS", style=shape.labelup, location=location.belowbar, color=bullColor, text="BOS", textcolor=color.white, size=size.tiny)
 plotshape(bearishBOS, title="Bearish BOS", style=shape.labeldown, location=location.abovebar, color=bearColor, text="BOS", textcolor=color.white, size=size.tiny)
+plotshape(longEntryFired, title="Long Order Submitted", style=shape.triangleup, location=location.belowbar, color=bullColor, size=size.tiny)
+plotshape(shortEntryFired, title="Short Order Submitted", style=shape.triangledown, location=location.abovebar, color=bearColor, size=size.tiny)
+bgcolor(dailyLossLocked ? color.new(color.red, 85) : useSessionFilter and not inSession ? color.new(color.gray, 90) : na)
 
-bgcolor(useSessionFilter and not inSession ? color.new(color.gray, 90) : na)
-bgcolor(dailyLossHit ? color.new(color.red, 85) : na)
-
-// ---------------- Alerts (only when a real order was submitted) ----------------
-alertcondition(longEntryFired,  title="SMC Long Entry",  message="SMC Long Entry Triggered")
-alertcondition(shortEntryFired, title="SMC Short Entry", message="SMC Short Entry Triggered")
-alertcondition(longExitFired,   title="SMC Long Exit",   message="SMC Long Exit Triggered")
-alertcondition(shortExitFired,  title="SMC Short Exit",  message="SMC Short Exit Triggered")
-alertcondition(dailyLossHit,    title="Daily Loss Limit Hit", message="Daily loss limit reached - trading paused")
-
-// ---------------- Clear Entry Latch ----------------
-justEntered := false
+// Order-fill alerts use alert_message above and {{strategy.order.alert_message}}.
+// alertcondition() does not create selectable alerts in a strategy.
+if dailyLossJustHit and enableRiskAlerts
+    alert("SMC Daily Loss Limit Hit: entries locked until the next trading day", alert.freq_once_per_bar_close)
+if enableSignalAlerts
+    if longEntryFired
+        alert("SMC Long Entry ORDER SUBMITTED (not a fill confirmation)", alert.freq_once_per_bar_close)
+    else if shortEntryFired
+        alert("SMC Short Entry ORDER SUBMITTED (not a fill confirmation)", alert.freq_once_per_bar_close)
+    else if marketExitFired
+        alert("SMC Market Exit ORDER SUBMITTED (not a fill confirmation)", alert.freq_once_per_bar_close)
